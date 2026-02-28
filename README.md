@@ -1,5 +1,9 @@
 # Debank Wallet Asset Sync
 
+- Python 3.9+ ✅
+- Playwright (Chromium) ✅
+- Windows / macOS / Linux ✅
+
 一个用于批量查询 DeBank 钱包资产的脚本：支持并发抓取、分批写入 Excel、断点续跑（程序中断后可继续补全未完成的钱包）。
 
 ## 功能特点
