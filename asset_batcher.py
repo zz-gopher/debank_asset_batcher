@@ -5,14 +5,18 @@ from typing import  List
 
 import pandas as pd
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
-# 后续可能网页格式更改 可以在这里替换
+
 SEL = 'div[class*="HeaderInfo_totalAssetInner__"]'
 EXCEL_PATH = Path("资产结果.xlsx")
 ADDR_FILE = "钱包地址.txt"
 
 
 async def fetch_value_for_wallet(context, wallet_address: str, retries=5) -> float:
-    last_err = None
+    """
+    两段式：
+    1) JS 等候选稳定值（快）
+    2) Python 短采样确认（稳）：2~3秒内多次读取，取最大值（防 6->11 慢更新）
+    """
     for attempt in range(1, retries + 1):
         page = None
         try:
@@ -21,7 +25,7 @@ async def fetch_value_for_wallet(context, wallet_address: str, retries=5) -> flo
             await page.goto(url, timeout=60000, wait_until="domcontentloaded")
             await page.wait_for_selector(SEL, timeout=30000)
 
-            # 等“稳定值”（不依赖 $0）
+            # ====== ① JS：等候选稳定值 ======
             raw = await page.evaluate("""
               async (selector) => {
                 const el = document.querySelector(selector);
@@ -33,8 +37,8 @@ async def fetch_value_for_wallet(context, wallet_address: str, retries=5) -> flo
                 };
                 const getNum = () => parseFloat(getRaw().replace(/[^0-9.]/g, '')) || 0;
 
-                const STABLE_MS = 800;
-                const TIMEOUT_MS = 25000;
+                const STABLE_MS = 1200;     // 值不变多久算稳定（可调）
+                const TIMEOUT_MS = 25000;  // 总超时
                 const start = Date.now();
 
                 return await new Promise((resolve) => {
@@ -44,8 +48,8 @@ async def fetch_value_for_wallet(context, wallet_address: str, retries=5) -> flo
                     const v = getNum();
                     const now = Date.now();
 
-                    // 前1秒不判稳定：防止旧值先显示
-                    if (now - start < 1000) { last = v; stableSince = now; return; }
+                    // 前 1 秒不判稳定：防止旧值/占位
+                    if (now - start < 1500) { last = v; stableSince = now; return; }
 
                     if (v !== last) { last = v; stableSince = now; return; }
 
@@ -59,26 +63,44 @@ async def fetch_value_for_wallet(context, wallet_address: str, retries=5) -> flo
                   obs.observe(el, { childList:true, characterData:true, subtree:true });
                   check();
 
-                  setTimeout(() => {
-                    obs.disconnect();
-                    resolve(getRaw()); // 超时返回当前看到的值，避免卡死
-                  }, TIMEOUT_MS);
+                  setTimeout(() => { obs.disconnect(); resolve(getRaw()); }, TIMEOUT_MS);
                 });
               }
             """, SEL)
 
             s = re.sub(r"[^0-9.]", "", raw or "")
-            value = float(s) if s else float("nan")
+            v1 = float(s) if s else float("nan")
+            if math.isnan(v1) or v1 <= 0:
+                raise ValueError(f"bad value raw={raw!r}, parsed={v1}")
 
-            # NaN 或 <=0 算失败，触发重试
-            if math.isnan(value) or value <= 0:
-                raise ValueError(f"bad value raw={raw!r}, parsed={value}")
+            # ====== ② Python：简单确认（拿到值后观察10秒）=====
+            v_final = v1
+            last_v = v1
 
-            return value
+            await asyncio.sleep(10.0)  # ✅ 等10秒，让页面有时间补齐/刷新
 
-        except (PWTimeoutError, Exception) as e:
-            last_err = e
-            await asyncio.sleep(min(2 * attempt, 8))  # 退避
+            v_now = await page.evaluate("""
+              (selector) => {
+                const el = document.querySelector(selector);
+                if (!el) return 0;
+                const t = Array.from(el.childNodes).find(n => n.nodeType === 3);
+                const raw = (t ? t.textContent : '').trim();
+                return parseFloat(raw.replace(/[^0-9.]/g,'')) || 0;
+              }
+            """, SEL)
+
+            # ✅ 如果10秒后变了，就取新的；没变就取旧的
+            if abs(v_now - last_v) > 1e-9:
+                v_final = v_now
+
+            # 如果 10 秒后读到 0/NaN，也别用它覆盖（保留 v1）
+            if (not math.isnan(v_final)) and v_final > 0:
+                return v_final
+            return v1
+
+        except (PWTimeoutError, Exception):
+            # 退避：越失败等越久一点
+            await asyncio.sleep(min(2 * attempt, 8))
         finally:
             if page:
                 await page.close()
