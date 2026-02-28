@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Data / Outputs (privacy & generated)
+data/jumper钱包地址.txt
+outputs/
+*.xlsx
+failed.txt
